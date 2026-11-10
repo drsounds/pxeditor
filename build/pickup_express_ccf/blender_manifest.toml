@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "pickup_express_ccf"
+version = "1.0.0"
+name = "Pickup Express CCF / OBJ"
+tagline = "Import/export Pickup Express (cc.dll) levels, vehicles and packages"
+maintainer = "pickup-express-tools"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+permissions = { files = "Read/write .ccf, .gti, .obj files" }

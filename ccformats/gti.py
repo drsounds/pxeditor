@@ -152,49 +152,96 @@ class GtiFile:
         w = max(1, im.width >> level); h = max(1, im.height >> level)
         return PILImage.frombytes("RGBA", (w, h), im.to_rgba(level))
 
+    def to_rgba_np(self, level: int = 0):
+        """Decode to a numpy uint8 array (h, w, 4) RGBA, top row first.  Falls back to the slow decoder."""
+        import numpy as np
+        im = self.best()
+        w = max(1, im.width >> level); h = max(1, im.height >> level)
+        name = im.fmt_name; data = np.frombuffer(im.mips[level], dtype=np.uint8)
+        out = np.empty((w * h, 4), np.uint8)
+        if name in ("P8", "AP88"):
+            pal = np.frombuffer(im.palette, np.uint8).reshape(-1, 4)
+            if name == "P8":
+                idx = data[:w * h]; a = np.full(w * h, 255, np.uint8)
+            else:
+                d = data[:w * h * 2].reshape(-1, 2); idx, a = d[:, 0], d[:, 1]
+            out[:, 0] = pal[idx, 2]; out[:, 1] = pal[idx, 1]; out[:, 2] = pal[idx, 0]; out[:, 3] = a
+        elif name in ("RGB888", "BGR888"):
+            d = data[:w * h * 3].reshape(-1, 3); out[:, 0] = d[:, 2]; out[:, 1] = d[:, 1]; out[:, 2] = d[:, 0]; out[:, 3] = 255
+        elif name in ("ARGB8888", "BGRA8888"):
+            d = data[:w * h * 4].reshape(-1, 4); out[:, 0] = d[:, 2]; out[:, 1] = d[:, 1]; out[:, 2] = d[:, 0]; out[:, 3] = d[:, 3]
+        else:
+            out = np.frombuffer(im.to_rgba(level), np.uint8).reshape(-1, 4).copy()
+        return out.reshape(h, w, 4)
+
     @staticmethod
     def from_pil(pil_img, mipmaps: bool = True, with_palette: bool = True) -> "GtiFile":
-        """Build a GTI (palettised + truecolour, with mip chain) from a PIL image."""
-        from PIL import Image as PILImage
-        img = pil_img.convert("RGBA")
-        has_alpha = any(a != 255 for a in img.getchannel("A").getdata())
-        w, h = img.size
-        levels = []
-        cur = img
-        while True:
+        import numpy as np
+        return GtiFile.from_rgba(np.asarray(pil_img.convert("RGBA")), mipmaps, with_palette)
+
+    @staticmethod
+    def from_rgba(rgba, mipmaps: bool = True, with_palette: bool = True) -> "GtiFile":
+        """Build a GTI (palettised + true colour image, full mip chain) from an (h, w, 4) uint8 numpy array.
+        Width and height should be powers of two (the engine's texture cache requires it).
+        No CRC0 chunk is written; the engine regenerates the checksum itself."""
+        import numpy as np
+        rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
+        h, w = rgba.shape[:2]
+        has_alpha = bool((rgba[:, :, 3] != 255).any())
+        levels = [rgba]
+        cur = rgba
+        while mipmaps and min(cur.shape[0], cur.shape[1]) >= 16 and cur.shape[0] % 2 == 0 and cur.shape[1] % 2 == 0:   # engine files stop at 8 px
+            c = cur.astype(np.uint16)
+            cur = ((c[0::2, 0::2] + c[1::2, 0::2] + c[0::2, 1::2] + c[1::2, 1::2] + 2) // 4).astype(np.uint8)
             levels.append(cur)
-            if not mipmaps or (cur.width <= 1 and cur.height <= 1) or cur.width % 2 or cur.height % 2:
-                break
-            cur = cur.resize((max(1, cur.width // 2), max(1, cur.height // 2)), PILImage.LANCZOS)
         g = GtiFile()
-        g.crcs.append(zlib.crc32(img.tobytes()) & 0xFFFFFFFF)
         if with_palette:
-            # palettised version: quantise level 0 and map all mips through the same palette
-            pal_img = img.convert("RGB").quantize(256, method=PILImage.Quantize.MEDIANCUT)
-            pal = pal_img.getpalette()[: 256 * 3]
-            pal += [0] * (768 - len(pal))
-            palette = bytearray()
-            for i in range(256):
-                palette += bytes((pal[i * 3 + 2], pal[i * 3 + 1], pal[i * 3], 0))
+            pal = _quantize(rgba[:, :, :3].reshape(-1, 3))
             mips = []
             for lv in levels:
-                q = lv.convert("RGB").quantize(palette=pal_img, dither=PILImage.Dither.NONE)
-                idx = q.tobytes()
+                idx = _nearest(lv[:, :, :3].reshape(-1, 3), pal).astype(np.uint8)
                 if has_alpha:
-                    a = lv.getchannel("A").tobytes()
-                    mips.append(bytes(b for pair in zip(idx, a) for b in pair))
-                else:
-                    mips.append(idx)
-            g.images.append(Image(FMT["AP88"] if has_alpha else FMT["P8"], w, h, bytes(palette), mips))
+                    idx = np.stack([idx, lv[:, :, 3].reshape(-1)], axis=1).reshape(-1)
+                mips.append(idx.tobytes())
+            palette = np.zeros((256, 4), np.uint8); palette[:, 0] = pal[:, 2]; palette[:, 1] = pal[:, 1]; palette[:, 2] = pal[:, 0]
+            g.images.append(Image(FMT["AP88"] if has_alpha else FMT["P8"], w, h, palette.tobytes(), mips))
         mips = []
         for lv in levels:
-            raw = lv.tobytes()
             if has_alpha:
-                mips.append(bytes(b for i in range(0, len(raw), 4) for b in (raw[i + 2], raw[i + 1], raw[i], raw[i + 3])))
+                mips.append(lv[:, :, [2, 1, 0, 3]].tobytes())
             else:
-                mips.append(bytes(b for i in range(0, len(raw), 4) for b in (raw[i + 2], raw[i + 1], raw[i])))
+                mips.append(lv[:, :, [2, 1, 0]].tobytes())
         g.images.append(Image(FMT["ARGB8888"] if has_alpha else FMT["RGB888"], w, h, b"", mips))
         return g
+
+
+def _nearest(px, pal):
+    import numpy as np
+    out = np.empty(len(px), np.int32)
+    p = pal.astype(np.int32); pn = (p * p).sum(1)
+    step = 16384
+    for i in range(0, len(px), step):
+        c = px[i:i + step].astype(np.int32)
+        d = pn[None, :] - 2 * c @ p.T
+        out[i:i + step] = d.argmin(1)
+    return out
+
+
+def _quantize(px, k: int = 256, iters: int = 6):
+    """Small k-means colour quantiser (numpy only). Returns (256, 3) uint8."""
+    import numpy as np
+    uniq = np.unique(px, axis=0)
+    if len(uniq) <= k:
+        pal = np.zeros((k, 3), np.uint8); pal[:len(uniq)] = uniq; return pal
+    rng = np.random.default_rng(1)
+    sample = px[rng.choice(len(px), min(len(px), 30000), replace=False)].astype(np.float32)
+    cent = sample[rng.choice(len(sample), k, replace=False)].copy()
+    for _ in range(iters):
+        idx = _nearest(sample.astype(np.int32), cent.astype(np.int32))
+        for j in range(k):
+            m = idx == j
+            if m.any(): cent[j] = sample[m].mean(0)
+    return np.clip(cent + 0.5, 0, 255).astype(np.uint8)
 
 
 if __name__ == "__main__":
