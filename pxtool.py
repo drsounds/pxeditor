@@ -21,7 +21,7 @@ def texture_dirs(ccf_path, game):
     d = os.path.dirname(os.path.abspath(ccf_path))
     dirs = [os.path.join(d, "Textures")]
     if game:
-        dirs += [os.path.join(game, "General", "Textures")]
+        dirs += [os.path.join(game, "General", "Textures"), os.path.join(game, "Posters")]
     return [x for x in dirs if os.path.isdir(x)]
 
 

@@ -178,7 +178,7 @@ TEXTURE_FORMATS = {i: n for i, n in enumerate(
     "DXT1 DXT2 DXT3 DXT4 DXT5 BGR565 BGRA4444 BGR888 BGRA8888 BGR233 BGR555 BGRA5551 BGRA2338 "
     "ABGR4444 ABGR8888 ABGR1555 ABGR8233 RGBA4444 RGBA8888 RGBA5551 RGBA3328 ARGB4565".split())}
 TEXTURE_FORMAT_IDS = {v: k for k, v in TEXTURE_FORMATS.items()}
-TEXTURE_SEARCH_PATHS = ["Towns/{town}/Textures", "General/Textures", "Vehicles/{vehicle}/Textures", "Packages/{package}/Textures"]
+TEXTURE_SEARCH_PATHS = ["Towns/{town}/Textures", "General/Textures", "Vehicles/{vehicle}/Textures", "Packages/{package}/Textures", "Posters"]
 
 # ---------------------------------------------------------------------------------------------
 # Game modes / towns / tcfg

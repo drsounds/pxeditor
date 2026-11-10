@@ -125,7 +125,7 @@ class IMPORT_SCENE_OT_ccf(bpy.types.Operator, ImportHelper):
         base = os.path.dirname(self.filepath)
         game = os.path.dirname(os.path.dirname(base)) if os.path.basename(os.path.dirname(base)) in ("Towns", "Vehicles", "Packages") else os.path.dirname(base)
         dirs = [self.texture_dir] if self.texture_dir else []
-        dirs += [os.path.join(base, "Textures"), os.path.join(game, "General", "Textures"), os.path.join(game, "Towns", "Textures")]
+        dirs += [os.path.join(base, "Textures"), os.path.join(game, "General", "Textures"), os.path.join(game, "Posters")]
         dirs = [d for d in dirs if d and os.path.isdir(d)]
         mats = {}
         for name, m in ir.materials.items():
@@ -438,7 +438,7 @@ class IMPORT_SCENE_OT_ccobj(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         ir = objio.import_obj(self.filepath)
         base = os.path.dirname(self.filepath)
-        imp = IMPORT_SCENE_OT_ccf.__new__(IMPORT_SCENE_OT_ccf)
+        import types; imp = types.SimpleNamespace(_link=lambda ob, room: _get_collection(room).objects.link(ob))
         mats = {}
         for name, m in ir.materials.items():
             mat = _make_material(m, [])

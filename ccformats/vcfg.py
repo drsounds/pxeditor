@@ -32,6 +32,7 @@ class VehicleConfig:
     flag: int = 0
     vectors: List[Tuple[float, float, float]] = field(default_factory=lambda: [(0.0, 0.0, 0.0)] * 5)
     scalars: List[float] = field(default_factory=lambda: [0.0] * 24)
+    name_raw: bytes = b""          # original 32 bytes (shipped files keep stale bytes after the terminator)
 
     @staticmethod
     def from_bytes(d: bytes) -> "VehicleConfig":
@@ -43,10 +44,13 @@ class VehicleConfig:
         vecs = [tuple(vals[i * 3:i * 3 + 3]) for i in range(5)]
         raw = d[97:97 + 96]
         scal = list(struct.unpack("<17f", raw[:68])) + list(struct.unpack("<5i", raw[68:88])) + list(struct.unpack("<2f", raw[88:96]))
-        return VehicleConfig(name, flag, vecs, scal)
+        return VehicleConfig(name, flag, vecs, scal, d[4:36])
 
     def to_bytes(self) -> bytes:
-        out = MAGIC + self.name.encode("latin-1")[:31].ljust(32, b"\0") + bytes([self.flag & 0xFF])
+        nb = self.name.encode("latin-1")[:31].ljust(32, bytes(1))
+        if self.name_raw and self.name_raw.split(bytes(1), 1)[0] == self.name.encode("latin-1"):
+            nb = self.name_raw
+        out = MAGIC + nb + bytes([self.flag & 0xFF])
         for v in self.vectors:
             out += struct.pack("<3f", *v)
         s = self.scalars

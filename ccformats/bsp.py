@@ -112,55 +112,62 @@ def _split(tri: Tri, n: Vec3, d: float, ds) -> Tuple[List[Tri], List[Tri]]:
 # ----------------------------------------------------------------------------------------------
 # tree construction
 # ----------------------------------------------------------------------------------------------
-def _choose_splitter(tris: List[Tri], rng: random.Random, samples: int) -> Tri:
-    if len(tris) <= samples:
-        cands = tris
-    else:
-        cands = rng.sample(tris, samples)
-    best = None; best_score = None
-    for c in cands:
-        n = c.n; d = _dot(n, c.v[0])
-        fp = fn = fs = 0
-        for t in tris:
-            k, _ = _classify(t, n, d)
-            if k == "P": fp += 1
-            elif k == "N": fn += 1
-            elif k == "S": fs += 1
-        score = fs * 6 + abs(fp - fn)
-        if best_score is None or score < best_score:
-            best, best_score = c, score
-    return best
+def build_tree(tris: Sequence[Tri], rng: Optional[random.Random] = None, samples: int = 16) -> Optional[ccf.BspNode]:
+    """Build an engine-compatible BSP tree from world-space triangles.
 
-
-def build_tree(tris: Sequence[Tri], rng: Optional[random.Random] = None, samples: int = 12) -> Optional[ccf.BspNode]:
-    """Build an engine-compatible BSP tree from world-space triangles (iterative, explicit stack)."""
+    Vectorised with numpy: every node evaluates `samples` candidate splitter planes against all of its
+    triangles at once (score = 6 * splits + |front - back|) and only the few straddling triangles are
+    clipped in Python.  Uses an explicit stack, so depth is not limited by the recursion limit."""
+    import numpy as np
     rng = rng or random.Random(1234)
     tris = [t for t in tris if not t.degenerate()]
     if not tris:
         return None
+    V = np.array([t.v for t in tris], dtype=np.float64)           # (N,3,3)
+    NR = np.array([t.n for t in tris], dtype=np.float64)          # (N,3)
+    OBJ = np.array([t.object_ref for t in tris], dtype=np.int64)
+    PI = np.array([t.poly_index for t in tris], dtype=np.int64)
     root = ccf.BspNode()
-    stack = [(root, tris)]
+    stack = [(root, V, NR, OBJ, PI)]
     while stack:
-        node, lst = stack.pop()
-        sp = _choose_splitter(lst, rng, samples)
-        n = sp.n; d = _dot(n, sp.v[0])
-        node.normal = n; node.point = sp.v[0]
-        pos: List[Tri] = []; neg: List[Tri] = []
-        for t in lst:
-            k, ds = _classify(t, n, d)
-            if k == "C":
-                node.children.append(make_bsp_poly(t))
-            elif k == "P":
-                pos.append(t)
-            elif k == "N":
-                neg.append(t)
-            else:
-                a, b = _split(t, n, d, ds)
-                pos.extend(a); neg.extend(b)
-        if neg:
-            node.neg = ccf.BspNode(); stack.append((node.neg, neg))
-        if pos:
-            node.pos = ccf.BspNode(); stack.append((node.pos, pos))
+        node, V, NR, OBJ, PI = stack.pop()
+        n_tri = len(V)
+        cand = list(range(n_tri)) if n_tri <= samples else rng.sample(range(n_tri), samples)
+        best = None; best_score = None
+        for c in cand:
+            n = NR[c]; d = float(n @ V[c, 0])
+            ds = V @ n - d
+            fr = (ds > EPS).any(1); bk = (ds < -EPS).any(1)
+            sp = (fr & bk).sum(); pc = (fr & ~bk).sum(); nc = (bk & ~fr).sum()
+            score = sp * 6 + abs(int(pc) - int(nc))
+            if best_score is None or score < best_score:
+                best, best_score = c, score
+                if score == 0: break
+        n = NR[best]; point = V[best, 0]; d = float(n @ point)
+        node.normal = (float(n[0]), float(n[1]), float(n[2])); node.point = (float(point[0]), float(point[1]), float(point[2]))
+        ds = V @ n - d
+        fr = (ds > EPS).any(1); bk = (ds < -EPS).any(1)
+        co = ~fr & ~bk; pos = fr & ~bk; neg = bk & ~fr; spl = fr & bk
+        for i in np.nonzero(co)[0]:
+            t = Tri(tuple(V[i, 0]), tuple(V[i, 1]), tuple(V[i, 2]), int(OBJ[i]), int(PI[i]))
+            node.children.append(make_bsp_poly(t))
+        pV, pN, pO, pP = [V[pos]], [NR[pos]], [OBJ[pos]], [PI[pos]]
+        nV, nN, nO, nP = [V[neg]], [NR[neg]], [OBJ[neg]], [PI[neg]]
+        extra_p = []; extra_n = []
+        for i in np.nonzero(spl)[0]:
+            t = Tri(tuple(V[i, 0]), tuple(V[i, 1]), tuple(V[i, 2]), int(OBJ[i]), int(PI[i]))
+            a, b = _split(t, tuple(n), d, [float(x) for x in ds[i]])
+            extra_p += a; extra_n += b
+        def pack(lst, vs, ns, os_, ps):
+            if lst:
+                vs.append(np.array([t.v for t in lst], dtype=np.float64)); ns.append(np.array([t.n for t in lst], dtype=np.float64))
+                os_.append(np.array([t.object_ref for t in lst], dtype=np.int64)); ps.append(np.array([t.poly_index for t in lst], dtype=np.int64))
+            return (np.concatenate(vs), np.concatenate(ns), np.concatenate(os_), np.concatenate(ps))
+        pv = pack(extra_p, pV, pN, pO, pP); nv = pack(extra_n, nV, nN, nO, nP)
+        if len(nv[0]):
+            node.neg = ccf.BspNode(); stack.append((node.neg,) + nv)
+        if len(pv[0]):
+            node.pos = ccf.BspNode(); stack.append((node.pos,) + pv)
     return root
 
 
