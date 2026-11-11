@@ -1,4 +1,4 @@
-"""Create a patched copy of Pickup.exe with typed "noclip", "fly" and "boost" cheats.
+"""Create a patched copy of Pickup.exe with typed "noclip", "fly", "boost" and "water" cheats.
 
 Usage:  python patch_noclip.py "<path>\\Pickup.exe" ["<output exe>"]
 
@@ -18,6 +18,11 @@ boost -- while the mode is on, the plus and minus keys (numpad, or the main-row
   keys of the layout selected by DIK_PLUS_MAIN/DIK_MINUS_MAIN) scale the local
   player's engine force and top speed up or down by 25% per press, between
   roughly 25% and 930%.  The current value is shown as a cheat message.
+
+water -- toggles what water does, for every vehicle.  Off (the default, as in
+  the original game): touching water paralyses the vehicle and respawns it,
+  after WATER_DELAY seconds (1.5; the original game used 1.0).  On: water is
+  an ordinary surface that can be driven on.
 
 Keys for every other vehicle (always active, no cheat word):
   PageDown         hold to make all other vehicles rise, like PageUp does
@@ -42,6 +47,7 @@ FLY_GAIN = 0x442A84      # float: climb momentum as a multiple of gravity force
 BOOST_ON = 0x442A83      # byte: boost mode
 NPC_FLY_KEY = 0x442A88   # byte: fly key for the other vehicles currently held
 ALWAYS = 0x442A89        # byte: constant 1, gate for keys without a mode
+WATER_SOLID = 0x442A8A   # byte: water behaves like a normal surface
 BOOST = 0x442B00         # float: engine force / top speed multiplier
 BOOST_UP = 0x442B04      # float: step applied by the plus key
 BOOST_DOWN = 0x442B08    # float: step applied by the minus key
@@ -55,7 +61,8 @@ FLOATS = {
 }
 # Initial values of the flag bytes at NOCLIP_ON.. (fly and boost start on).
 FLAGS = {NOCLIP_ON: 0, FLY_ON: 1, FLY_KEY: 0, BOOST_ON: 1,
-         NPC_FLY_KEY: 0, ALWAYS: 1}
+         NPC_FLY_KEY: 0, ALWAYS: 1, WATER_SOLID: 0}
+WATER_DELAY = 1.5        # seconds between touching water and the respawn
 KEYTAB = 0x442B80        # key table read by the key event hook, see key_table()
 STRINGS = {
     "noclip": (0x442A90, b"noclip"),
@@ -69,6 +76,9 @@ STRINGS = {
     "boost_off": (0x442B50, b"Boost mode OFF"),
     "boost_fmt": (0x442B60, b"Boost %d%%"),
     "npc_fmt": (0x442B70, b"NPC boost %d%%"),
+    "water": (0x442D00, b"water"),
+    "water_on": (0x442D10, b"Water is solid"),
+    "water_off": (0x442D20, b"Water respawns you"),
 }
 
 FLY_GAIN_VALUE = -0.75   # negative: push against gravity
@@ -214,7 +224,20 @@ def assemble_cave(labels, short=frozenset()):
     a.label("cheat_fly")
     a.cheat_word("fly", FLY_ON, "fly_on", "fly_off", "cheat_boost")
     a.label("cheat_boost")
-    a.cheat_word("boost", BOOST_ON, "boost_on", "boost_off", CHEAT_NONE)
+    a.cheat_word("boost", BOOST_ON, "boost_on", "boost_off", "cheat_water")
+    a.label("cheat_water")
+    a.cheat_word("water", WATER_SOLID, "water_on", "water_off", CHEAT_NONE)
+
+    # --- water: the two places that flag a touched polygon as water ---------
+    # (flags = material type compared with 15; body collision, then wheels)
+    for name, flag_slot, back in (("water_body", 0x13, 0x43794F),
+                                  ("water_wheel", 0x23, 0x4384C2)):
+        a.label(name)
+        a.jcc(0x85, back)                           # jne: not water (original)
+        a.cmp_byte_zero(WATER_SOLID)
+        a.jcc(0x85, back)                           # solid water: do not flag it
+        a.raw(0xC6, 0x44, 0x24, flag_slot, 0x01)    # mov byte [esp+slot], 1 (orig)
+        a.jmp(back)
 
     # --- noclip: body-vs-world collision in Vehicle::StaticCollision -------
     a.label("world")
@@ -392,6 +415,11 @@ def build():
         (0x4348C3, bytes.fromhex("8bcdc6855d01000000"), hook(0x4348C3, "lift", 9)),
         (0x43428D, bytes.fromhex("d9416c7406"), hook(0x43428D, "topspeed", 5)),
         (0x434336, bytes.fromhex("d889dc000000"), hook(0x434336, "accel", 6)),
+        (0x437948, bytes.fromhex("7505c644241301"), hook(0x437948, "water_body", 7)),
+        (0x4384BB, bytes.fromhex("7505c644242301"), hook(0x4384BB, "water_wheel", 7)),
+        # push 1.0 -> push WATER_DELAY: paralysis time before the respawn
+        (0x437AFD, bytes.fromhex("680000803f"), b"h" + struct.pack("<f", WATER_DELAY)),
+        (0x439079, bytes.fromhex("680000803f"), b"h" + struct.pack("<f", WATER_DELAY)),
         (CAVE, bytes(len(cave)), cave),
         (KEYTAB, bytes(len(key_table())), key_table()),
         (FLY_GAIN, bytes(4), struct.pack("<f", FLY_GAIN_VALUE)),
