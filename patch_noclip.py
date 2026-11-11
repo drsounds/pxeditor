@@ -1,12 +1,17 @@
-"""Create a patched copy of Pickup.exe with a typed "noclip" cheat.
+"""Create a patched copy of Pickup.exe with typed "noclip" and "fly" cheats.
 
 Usage:  python patch_noclip.py "<path>\\Pickup.exe" ["<output exe>"]
 
-Typing ``noclip`` in-game (like the built-in cheat words) toggles a flag.
-While it is on, the local player's vehicle:
+Both words are typed in-game like the built-in cheat words and toggle a mode.
+
+noclip -- the local player's vehicle:
   * skips the body-vs-world (wall/building) collision response, and
   * skips vehicle-vs-vehicle collisions (both directions).
-Wheel/ground contact and item pickups are left untouched.
+  Wheel/ground contact and item pickups are left untouched.
+
+fly -- while the mode is on, holding PageUp makes the local player's vehicle
+  rise: its vertical momentum is set against gravity every physics tick.
+  Releasing the key lets it fall again.
 
 Only valid for the 282,624 byte Pickup.exe dated 2000-04-06; every patched
 site is byte-verified before anything is written.
@@ -16,25 +21,51 @@ import sys
 from pathlib import Path
 
 BASE = 0x400000          # image base; all sections have RVA == file offset
-CAVE = 0x43BD00          # unused zero padding at the end of .text
-FLAG = 0x442A80          # unused zero padding at the end of .data
-STR_WORD = 0x442A90      # "noclip"
-STR_ON = 0x442AA0        # "Noclip ON"
-STR_OFF = 0x442AB0       # "Noclip OFF"
+CAVE = 0x43BD00          # unused zero padding at the end of .text (0x300 bytes)
+CAVE_END = 0x43C000
+
+# Unused zero padding at the end of .data
+NOCLIP_ON = 0x442A80     # byte: noclip mode
+FLY_ON = 0x442A81        # byte: fly mode
+FLY_KEY = 0x442A82       # byte: fly key currently held
+FLY_GAIN = 0x442A84      # float: climb momentum as a multiple of gravity force
+STRINGS = {
+    "noclip": (0x442A90, b"noclip"),
+    "noclip_on": (0x442AA0, b"Noclip ON"),
+    "noclip_off": (0x442AB0, b"Noclip OFF"),
+    "fly": (0x442AC0, b"fly"),
+    "fly_on": (0x442AD0, b"Fly mode ON (hold PageUp)"),
+    "fly_off": (0x442AF0, b"Fly mode OFF"),
+}
+
+FLY_GAIN_VALUE = -0.75   # negative: push against gravity
+DIK_PRIOR = 0xC9         # PageUp, DirectInput scancode
+VK_PRIOR = 0x21          # PageUp, Windows virtual key
 
 CHEAT_TAIL = 0x4143D2    # shared "show cheat message" tail (edi=msg, edx=dest)
 CHEAT_NONE = 0x4144ED    # "no cheat matched" exit
+CHEAT_BUF_END = 0x2C9    # game+0x2c9: one past the last typed character
 LOCAL_VEHICLE = 0x12D4   # game->localVehicle ; vehicle->game is at +0x10
+VEH_TYPE = 0xF0          # vehicle->type ; type+0x60 = gravity
+VEH_GRAV_SCALE = 0xE0    # vehicle: gravity force = type.gravity * this
+VEH_MOMENTUM_Y = 0x11B0  # vehicle rigid body (+0x1150) linear momentum (+0x5c), Y
 
 
 class Asm:
-    def __init__(self, org):
+    def __init__(self, org, labels=None):
         self.org = org
         self.buf = bytearray()
+        self.labels = {} if labels is None else labels
 
     @property
     def here(self):
         return self.org + len(self.buf)
+
+    def label(self, name):
+        self.labels[name] = self.here
+
+    def _target(self, t):
+        return self.labels.get(t, 0) if isinstance(t, str) else t
 
     def raw(self, *b):
         self.buf += bytes(b)
@@ -44,89 +75,143 @@ class Asm:
 
     def jmp(self, target):
         self.raw(0xE9)
-        self.d32(target - (self.here + 4))
+        self.d32(self._target(target) - (self.here + 4))
 
-    def jcc(self, cc, target):          # cc: 0x84 = je, 0x85 = jne
+    def jcc(self, cc, target):          # cc: 0x84 je, 0x85 jne, 0x87 ja
         self.raw(0x0F, cc)
-        self.d32(target - (self.here + 4))
+        self.d32(self._target(target) - (self.here + 4))
 
-    def cmp_flag_zero(self):            # cmp byte ptr [FLAG], 0
+    def cmp_byte_zero(self, addr):      # cmp byte ptr [addr], 0
         self.raw(0x80, 0x3D)
-        self.d32(FLAG)
+        self.d32(addr)
         self.raw(0x00)
 
-    def load_game(self):                # mov eax, [edi+0x10]
-        self.raw(0x8B, 0x47, 0x10)
+    def cheat_word(self, word, flag, on, off, no_match):
+        """Match a typed word, toggle a flag byte, show the on/off message."""
+        addr, text = STRINGS[word]
+        self.raw(0x6A, len(text))                       # push len
+        self.raw(0x8D, 0x85)                            # lea eax, [ebp+buf]
+        self.d32(CHEAT_BUF_END - len(text))
+        self.raw(0x68); self.d32(addr)                  # push word
+        self.raw(0x50)                                  # push eax
+        self.raw(0xFF, 0xD6)                            # call esi (strncmp)
+        self.raw(0x83, 0xC4, 0x0C)                      # add esp, 0xc
+        self.raw(0x85, 0xC0)                            # test eax, eax
+        self.jcc(0x85, no_match)
+        self.raw(0x80, 0x35); self.d32(flag)            # xor byte [flag], 1
+        self.raw(0x01)
+        self.raw(0x8D, 0x95); self.d32(CHEAT_BUF_END)   # lea edx, [ebp+0x2c9]
+        self.raw(0xBF); self.d32(STRINGS[on][0])        # mov edi, on message
+        self.jcc(0x85, CHEAT_TAIL)                      # flag is now 1
+        self.raw(0xBF); self.d32(STRINGS[off][0])       # mov edi, off message
+        self.jmp(CHEAT_TAIL)
 
-    def cmp_reg_local(self, modrm):     # cmp <reg>, [eax+0x12d4]
-        self.raw(0x3B, modrm)
-        self.d32(LOCAL_VEHICLE)
 
+def assemble_cave(labels):
+    a = Asm(CAVE, labels)
 
-def build():
-    a = Asm(CAVE)
+    # --- extra cheat words, reached when "atlantis" did not match ----------
+    a.label("cheat")
+    a.cheat_word("noclip", NOCLIP_ON, "noclip_on", "noclip_off", "cheat_fly")
+    a.label("cheat_fly")
+    a.cheat_word("fly", FLY_ON, "fly_on", "fly_off", CHEAT_NONE)
 
-    # --- A: extra cheat word, reached when "atlantis" did not match -------
-    cheat = a.here
-    a.raw(0x6A, 0x06)                               # push 6
-    a.raw(0x8D, 0x85); a.d32(0x2C3)                 # lea eax, [ebp+0x2c3]
-    a.raw(0x68); a.d32(STR_WORD)                    # push "noclip"
-    a.raw(0x50)                                     # push eax
-    a.raw(0xFF, 0xD6)                               # call esi (strncmp)
-    a.raw(0x83, 0xC4, 0x0C)                         # add esp, 0xc
-    a.raw(0x85, 0xC0)                               # test eax, eax
-    a.jcc(0x85, CHEAT_NONE)                         # jne -> no match
-    a.raw(0x80, 0x35); a.d32(FLAG); a.raw(0x01)     # xor byte [FLAG], 1
-    a.raw(0x8D, 0x95); a.d32(0x2C9)                 # lea edx, [ebp+0x2c9]
-    a.raw(0xBF); a.d32(STR_ON)                      # mov edi, "Noclip ON"
-    a.jcc(0x85, CHEAT_TAIL)                         # jnz (flag now 1)
-    a.raw(0xBF); a.d32(STR_OFF)                     # mov edi, "Noclip OFF"
-    a.jmp(CHEAT_TAIL)
-
-    # --- B: body-vs-world collision in Vehicle::StaticCollision ------------
-    world = a.here
+    # --- noclip: body-vs-world collision in Vehicle::StaticCollision -------
+    a.label("world")
     a.raw(0x84, 0xC0)                               # test al, al   (original)
     a.jcc(0x84, 0x437B2F)                           # je  exit      (original)
-    a.cmp_flag_zero()
+    a.cmp_byte_zero(NOCLIP_ON)
     a.jcc(0x84, 0x4376DC)                           # noclip off -> continue
-    a.load_game()
-    a.cmp_reg_local(0xB8)                           # cmp edi, [eax+0x12d4]
+    a.raw(0x8B, 0x47, 0x10)                         # mov eax, [edi+0x10]
+    a.raw(0x3B, 0xB8); a.d32(LOCAL_VEHICLE)         # cmp edi, [eax+0x12d4]
     a.jcc(0x84, 0x437B2F)                           # local player -> skip
     a.jmp(0x4376DC)
 
-    # --- C: vehicle-vs-vehicle collision loop ------------------------------
-    cars = a.here
+    # --- noclip: vehicle-vs-vehicle collision loop --------------------------
+    a.label("cars")
     a.raw(0x85, 0xED)                               # test ebp, ebp (original)
     a.jcc(0x84, 0x43755D)                           # je  skip      (original)
-    a.cmp_flag_zero()
+    a.cmp_byte_zero(NOCLIP_ON)
     a.jcc(0x84, 0x437238)                           # noclip off -> continue
-    a.load_game()
-    a.cmp_reg_local(0xB8)                           # this  == local vehicle?
+    a.raw(0x8B, 0x47, 0x10)                         # mov eax, [edi+0x10]
+    a.raw(0x3B, 0xB8); a.d32(LOCAL_VEHICLE)         # this  == local vehicle?
     a.jcc(0x84, 0x43755D)
-    a.cmp_reg_local(0xB0)                           # other == local vehicle?
+    a.raw(0x3B, 0xB0); a.d32(LOCAL_VEHICLE)         # other == local vehicle?
     a.jcc(0x84, 0x43755D)
     a.jmp(0x437238)
 
-    def hook(site, target, size):
+    # --- fly: track PageUp in the key event loop ----------------------------
+    # event type: 1/2 = DirectInput down/up, 3/4 = window message down/up
+    a.label("keys")
+    a.raw(0x8B, 0x44, 0x24, 0x20)                   # mov eax, [esp+0x20] (orig)
+    a.raw(0x8B, 0x6C, 0x24, 0x24)                   # mov ebp, [esp+0x24] (orig)
+    a.raw(0x83, 0xF8, 0x02)                         # cmp eax, 2
+    a.jcc(0x87, "keys_vk")                          # ja
+    a.raw(0x81, 0xFD); a.d32(DIK_PRIOR)             # cmp ebp, DIK_PRIOR
+    a.jcc(0x85, "keys_out")
+    a.jmp("keys_set")
+    a.label("keys_vk")
+    a.raw(0x83, 0xF8, 0x04)                         # cmp eax, 4
+    a.jcc(0x87, "keys_out")                         # ja
+    a.raw(0x83, 0xFD, VK_PRIOR)                     # cmp ebp, VK_PRIOR
+    a.jcc(0x85, "keys_out")
+    a.label("keys_set")
+    a.raw(0xA8, 0x01)                               # test al, 1 (odd = down)
+    a.raw(0x0F, 0x95, 0x05); a.d32(FLY_KEY)         # setnz byte [FLY_KEY]
+    a.label("keys_out")
+    a.jmp(0x41E0A6)
+
+    # --- fly: per-tick lift in the vehicle update (ebp = vehicle) -----------
+    a.label("lift")
+    a.raw(0x8B, 0xCD)                               # mov ecx, ebp      (orig)
+    a.raw(0xC6, 0x85); a.d32(0x15D); a.raw(0x00)    # mov byte [ebp+0x15d], 0
+    a.cmp_byte_zero(FLY_ON)
+    a.jcc(0x84, "lift_out")
+    a.cmp_byte_zero(FLY_KEY)
+    a.jcc(0x84, "lift_out")
+    a.raw(0x8B, 0x45, 0x10)                         # mov eax, [ebp+0x10]
+    a.raw(0x3B, 0xA8); a.d32(LOCAL_VEHICLE)         # cmp ebp, [eax+0x12d4]
+    a.jcc(0x85, "lift_out")
+    a.raw(0x8B, 0x85); a.d32(VEH_TYPE)              # mov eax, [ebp+0xf0]
+    a.raw(0xD9, 0x40, 0x60)                         # fld  dword [eax+0x60]
+    a.raw(0xD8, 0x8D); a.d32(VEH_GRAV_SCALE)        # fmul dword [ebp+0xe0]
+    a.raw(0xD8, 0x0D); a.d32(FLY_GAIN)              # fmul dword [FLY_GAIN]
+    a.raw(0xD9, 0x9D); a.d32(VEH_MOMENTUM_Y)        # fstp dword [ebp+0x11b0]
+    a.label("lift_out")
+    a.jmp(0x4348CC)
+
+    return bytes(a.buf)
+
+
+def build():
+    labels = {}
+    assemble_cave(labels)               # pass 1: collect label addresses
+    cave = assemble_cave(labels)        # pass 2: resolve forward references
+    assert CAVE + len(cave) <= CAVE_END
+
+    def hook(site, label, size):
         h = Asm(site)
-        h.jmp(target)
+        h.jmp(labels[label])
         h.buf += b"\x90" * (size - len(h.buf))
         return bytes(h.buf)
 
     jne = Asm(0x4143BA)
-    jne.jcc(0x85, cheat)
+    jne.jcc(0x85, labels["cheat"])
 
     # (address, expected original bytes, replacement)
-    return [
+    patches = [
         (0x4143BA, bytes.fromhex("0f852d010000"), bytes(jne.buf)),
-        (0x4376D4, bytes.fromhex("84c00f8453040000"), hook(0x4376D4, world, 8)),
-        (0x437230, bytes.fromhex("85ed0f8425030000"), hook(0x437230, cars, 8)),
-        (CAVE, bytes(len(a.buf)), bytes(a.buf)),
-        (FLAG, bytes(1), bytes(1)),
-        (STR_WORD, bytes(7), b"noclip\0"),
-        (STR_ON, bytes(10), b"Noclip ON\0"),
-        (STR_OFF, bytes(11), b"Noclip OFF\0"),
+        (0x4376D4, bytes.fromhex("84c00f8453040000"), hook(0x4376D4, "world", 8)),
+        (0x437230, bytes.fromhex("85ed0f8425030000"), hook(0x437230, "cars", 8)),
+        (0x41E09E, bytes.fromhex("8b4424208b6c2424"), hook(0x41E09E, "keys", 8)),
+        (0x4348C3, bytes.fromhex("8bcdc6855d01000000"), hook(0x4348C3, "lift", 9)),
+        (CAVE, bytes(len(cave)), cave),
+        (NOCLIP_ON, bytes(4), bytes(4)),
+        (FLY_GAIN, bytes(4), struct.pack("<f", FLY_GAIN_VALUE)),
     ]
+    for addr, text in STRINGS.values():
+        patches.append((addr, bytes(len(text) + 1), text + b"\0"))
+    return patches
 
 
 def grow_sections(data):
