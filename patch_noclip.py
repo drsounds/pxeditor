@@ -32,6 +32,9 @@ Keys for every other vehicle (always active, no cheat word):
   Backspace        hold to drive them backwards: their engine pushes against
                    their driving direction with 10x force (REV_GAIN), so they
                    speed up in reverse for as long as the key is held
+  Tab              press to turn them upside down (press again to turn them
+                   back): each one is rotated half a turn about a horizontal
+                   axis, in place
 
 Only valid for the 282,624 byte Pickup.exe dated 2000-04-06; every patched
 site is byte-verified before anything is written.
@@ -56,6 +59,9 @@ NPC_FLY_KEY = 0x442A88   # byte: fly key for the other vehicles currently held
 ALWAYS = 0x442A89        # byte: constant 1, gate for keys without a mode
 WATER_SOLID = 0x442A8A   # byte: water behaves like a normal surface
 NPC_REV_KEY = 0x442A8B   # byte: reverse key for the other vehicles currently held
+NPC_FLIP = 0x442A8C      # byte: countdown 2 -> 1 -> 0 after the flip key; the
+#                          other vehicles flip while it is 1 (see "lift")
+#                          0x442A8D: flip key currently held (no auto-repeat)
 REV_GAIN = 0x442B1C      # float: drive force while reversed, in engine forces
 BOOST = 0x442B00         # float: engine force / top speed multiplier
 BOOST_UP = 0x442B04      # float: step applied by the plus key
@@ -71,7 +77,8 @@ FLOATS = {
 }
 # Initial values of the flag bytes at NOCLIP_ON.. (fly and boost start on).
 FLAGS = {NOCLIP_ON: 0, FLY_ON: 1, FLY_KEY: 0, BOOST_ON: 1,
-         NPC_FLY_KEY: 0, ALWAYS: 1, WATER_SOLID: 0, NPC_REV_KEY: 0}
+         NPC_FLY_KEY: 0, ALWAYS: 1, WATER_SOLID: 0, NPC_REV_KEY: 0,
+         NPC_FLIP: 0, NPC_FLIP + 1: 0}
 WATER_DELAY = 1.5        # seconds between touching water and the respawn
 KEYTAB = 0x442B80        # key table read by the key event hook, see key_table()
 STRINGS = {
@@ -86,9 +93,9 @@ STRINGS = {
     "boost_off": (0x442B50, b"Boost mode OFF"),
     "boost_fmt": (0x442B60, b"Boost %d%%"),
     "npc_fmt": (0x442B70, b"NPC boost %d%%"),
-    "water": (0x442D00, b"water"),
-    "water_on": (0x442D10, b"Water is solid"),
-    "water_off": (0x442D20, b"Water respawns you"),
+    "water": (0x442E00, b"water"),
+    "water_on": (0x442E10, b"Water is solid"),
+    "water_off": (0x442E20, b"Water respawns you"),
 }
 
 FLY_GAIN_VALUE = -0.75   # negative: push against gravity
@@ -103,6 +110,7 @@ DIK_NEXT, VK_NEXT = 0xD1, 0x22              # PageDown: other vehicles fly
 DIK_INSERT, VK_INSERT = 0xD2, 0x2D          # Insert: other vehicles faster
 DIK_DELETE, VK_DELETE = 0xD3, 0x2E          # Delete: other vehicles slower
 DIK_BACK, VK_BACK = 0x0E, 0x08              # Backspace: other vehicles reverse
+DIK_TAB, VK_TAB = 0x0F, 0x09                # Tab: other vehicles upside down
 
 CHEAT_TAIL = 0x4143D2    # shared "show cheat message" tail (edi=msg, edx=dest)
 CHEAT_NONE = 0x4144ED    # "no cheat matched" exit
@@ -118,6 +126,8 @@ VEH_GRAV_SCALE = 0xE0    # vehicle: gravity force = type.gravity * this
 TYPE_TOP_SPEED = 0x6C    # type: speed above which the engine stops pushing
 TYPE_ENGINE_FORCE = 0xDC # type: forward engine force per unit of throttle
 VEH_DRIVE_FORCE = 0x144  # vehicle: engine force applied at the driven wheels
+VEH_QUAT = 0x119C        # vehicle rigid body (+0x1150) orientation quaternion
+#                          (+0x4c, 4 floats), renormalised by CcRigidBody::PostODE
 VEH_MOMENTUM_Y = 0x11B0  # vehicle rigid body (+0x1150) linear momentum (+0x5c), Y
 
 
@@ -204,6 +214,8 @@ def key_table():
     key     scancode for DirectInput events, 0x100 + virtual key for window
             message events
     target  step == 0: byte that is set while the key is held
+            step == 1: byte that is set to 2 on press; the byte after it
+                       tracks the key so that auto-repeat does not retrigger
             otherwise: float that is multiplied by the float at `step` on press
     gate    byte that must be non-zero for the key to do anything
     The table ends with a zero key.
@@ -216,6 +228,7 @@ def key_table():
 
     rows = hold(DIK_PRIOR, VK_PRIOR, FLY_KEY) + hold(DIK_NEXT, VK_NEXT, NPC_FLY_KEY)
     rows += hold(DIK_BACK, VK_BACK, NPC_REV_KEY)
+    rows += [(k, NPC_FLIP, 1, ALWAYS, 0) for k in (DIK_TAB, 0x100 + VK_TAB)]
     rows += scale((DIK_ADD, DIK_PLUS_MAIN, 0x100 + VK_ADD, 0x100 + VK_OEM_PLUS),
                   BOOST, BOOST_UP, BOOST_ON, "boost_fmt")
     rows += scale((DIK_SUBTRACT, DIK_MINUS_MAIN, 0x100 + VK_SUBTRACT,
@@ -303,10 +316,22 @@ def assemble_cave(labels, short=frozenset()):
     a.raw(0x80, 0x39, 0x00)                         # cmp byte [ecx], 0
     a.jcc(0x84, "keys_out")
     a.raw(0x8B, 0x4A, 0x04)                         # mov ecx, [edx+4] (target)
-    a.raw(0x83, 0x7A, 0x08, 0x00)                   # cmp dword [edx+8], 0 (step)
-    a.jcc(0x85, "keys_scale")
+    a.raw(0x83, 0x7A, 0x08, 0x01)                   # cmp dword [edx+8], 1 (step)
+    a.jcc(0x84, "keys_trigger")
+    a.jcc(0x87, "keys_scale")                       # ja: step is a pointer
     a.raw(0xA8, 0x01)                               # test al, 1 (odd = down)
     a.raw(0x0F, 0x95, 0x01)                         # setnz byte [ecx]
+    a.jmp("keys_out")
+
+    a.label("keys_trigger")
+    a.raw(0xA8, 0x01)                               # test al, 1
+    a.jcc(0x84, "keys_trigger_up")
+    a.raw(0x80, 0x79, 0x01, 0x00)                   # cmp byte [ecx+1], 0
+    a.jcc(0x85, "keys_out")                         # still held: auto-repeat
+    a.raw(0x66, 0xC7, 0x01, 0x02, 0x01)             # mov word [ecx], 0x0102
+    a.jmp("keys_out")
+    a.label("keys_trigger_up")
+    a.raw(0xC6, 0x41, 0x01, 0x00)                   # mov byte [ecx+1], 0
     a.jmp("keys_out")
 
     a.label("keys_scale")
@@ -399,12 +424,27 @@ def assemble_cave(labels, short=frozenset()):
     a.raw(0x8B, 0x45, 0x10)                         # mov eax, [ebp+0x10]
     a.raw(0x3B, 0xA8); a.d32(LOCAL_VEHICLE)         # cmp ebp, [eax+0x12d4]
     a.jcc(0x85, "lift_npc")
+    # The local vehicle counts NPC_FLIP down once per tick, so every other
+    # vehicle sees the value 1 in exactly one of its own ticks.
+    a.cmp_byte_zero(NPC_FLIP)
+    a.jcc(0x84, "lift_local")
+    a.raw(0xFE, 0x0D); a.d32(NPC_FLIP)              # dec byte [NPC_FLIP]
+    a.label("lift_local")
     a.cmp_byte_zero(FLY_ON)
     a.jcc(0x84, "lift_out")
     a.cmp_byte_zero(FLY_KEY)
     a.jcc(0x84, "lift_out")
     a.jmp("lift_up")
     a.label("lift_npc")
+    a.raw(0x80, 0x3D); a.d32(NPC_FLIP); a.raw(0x01) # cmp byte [NPC_FLIP], 1
+    a.jcc(0x85, "lift_npc_fly")
+    # Half a turn about a horizontal axis: (q0, q1, q2, q3) -> (-q1, q0, -q3, q2)
+    for q in (VEH_QUAT, VEH_QUAT + 8):
+        a.raw(0x8B, 0x85); a.d32(q)                 # mov  eax, [ebp+q]
+        a.raw(0x87, 0x85); a.d32(q + 4)             # xchg eax, [ebp+q+4]
+        a.raw(0x35); a.d32(0x80000000)              # xor  eax, sign bit
+        a.raw(0x89, 0x85); a.d32(q)                 # mov  [ebp+q], eax
+    a.label("lift_npc_fly")
     a.cmp_byte_zero(NPC_FLY_KEY)
     a.jcc(0x84, "lift_out")
     a.label("lift_up")
@@ -468,6 +508,9 @@ def build():
         patches.append((addr, bytes(4), struct.pack("<f", value)))
     for addr, text in STRINGS.values():
         patches.append((addr, bytes(len(text) + 1), text + b"\0"))
+    spans = sorted((addr, addr + len(new)) for addr, _old, new in patches)
+    for (_, end), (start, _) in zip(spans, spans[1:]):
+        assert end <= start, f"patches overlap at {start:#x}"
     return patches
 
 
