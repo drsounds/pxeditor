@@ -3,6 +3,7 @@
 Usage:  python patch_noclip.py "<path>\\Pickup.exe" ["<output exe>"]
 
 The words are typed in-game like the built-in cheat words and toggle a mode.
+Fly and boost start switched ON; noclip starts OFF.
 
 noclip -- the local player's vehicle:
   * skips the body-vs-world (wall/building) collision response, and
@@ -16,7 +17,11 @@ fly -- while the mode is on, holding PageUp makes the local player's vehicle
 boost -- while the mode is on, the plus and minus keys (numpad, or the main-row
   keys of the layout selected by DIK_PLUS_MAIN/DIK_MINUS_MAIN) scale the local
   player's engine force and top speed up or down by 25% per press, between
-  roughly 30% and 900%.  The current value is shown as a cheat message.
+  roughly 25% and 930%.  The current value is shown as a cheat message.
+
+Keys for every other vehicle (always active, no cheat word):
+  PageDown         hold to make all other vehicles rise, like PageUp does
+  Insert / Delete  scale their engine force and top speed up / down
 
 Only valid for the 282,624 byte Pickup.exe dated 2000-04-06; every patched
 site is byte-verified before anything is written.
@@ -35,16 +40,23 @@ FLY_ON = 0x442A81        # byte: fly mode
 FLY_KEY = 0x442A82       # byte: fly key currently held
 FLY_GAIN = 0x442A84      # float: climb momentum as a multiple of gravity force
 BOOST_ON = 0x442A83      # byte: boost mode
+NPC_FLY_KEY = 0x442A88   # byte: fly key for the other vehicles currently held
+ALWAYS = 0x442A89        # byte: constant 1, gate for keys without a mode
 BOOST = 0x442B00         # float: engine force / top speed multiplier
 BOOST_UP = 0x442B04      # float: step applied by the plus key
 BOOST_DOWN = 0x442B08    # float: step applied by the minus key
-BOOST_MAX = 0x442B0C     # float: plus is ignored at or above this
-BOOST_MIN = 0x442B10     # float: minus is ignored at or below this
+BOOST_MAX = 0x442B0C     # float: a step that would go above this is ignored
+BOOST_MIN = 0x442B10     # float: a step that would go below this is ignored
 HUNDRED = 0x442B14       # float: 100.0, for the percentage message
+NPC_BOOST = 0x442B18     # float: multiplier for every other vehicle
 FLOATS = {
     BOOST: 1.0, BOOST_UP: 1.25, BOOST_DOWN: 0.8,
-    BOOST_MAX: 8.0, BOOST_MIN: 0.3, HUNDRED: 100.0,
+    BOOST_MAX: 9.5, BOOST_MIN: 0.25, HUNDRED: 100.0, NPC_BOOST: 1.0,
 }
+# Initial values of the flag bytes at NOCLIP_ON.. (fly and boost start on).
+FLAGS = {NOCLIP_ON: 0, FLY_ON: 1, FLY_KEY: 0, BOOST_ON: 1,
+         NPC_FLY_KEY: 0, ALWAYS: 1}
+KEYTAB = 0x442B80        # key table read by the key event hook, see key_table()
 STRINGS = {
     "noclip": (0x442A90, b"noclip"),
     "noclip_on": (0x442AA0, b"Noclip ON"),
@@ -56,6 +68,7 @@ STRINGS = {
     "boost_on": (0x442B30, b"Boost mode ON (+/- keys)"),
     "boost_off": (0x442B50, b"Boost mode OFF"),
     "boost_fmt": (0x442B60, b"Boost %d%%"),
+    "npc_fmt": (0x442B70, b"NPC boost %d%%"),
 }
 
 FLY_GAIN_VALUE = -0.75   # negative: push against gravity
@@ -66,6 +79,9 @@ DIK_PLUS_MAIN, DIK_MINUS_MAIN = 0x0C, 0x35  # main-row + / - on a Swedish layout
 #                                             (US layout: 0x0D and 0x0C)
 VK_ADD, VK_SUBTRACT = 0x6B, 0x6D            # numpad + / -, virtual keys
 VK_OEM_PLUS, VK_OEM_MINUS = 0xBB, 0xBD      # main-row + / - on any layout
+DIK_NEXT, VK_NEXT = 0xD1, 0x22              # PageDown: other vehicles fly
+DIK_INSERT, VK_INSERT = 0xD2, 0x2D          # Insert: other vehicles faster
+DIK_DELETE, VK_DELETE = 0xD3, 0x2E          # Delete: other vehicles slower
 
 CHEAT_TAIL = 0x4143D2    # shared "show cheat message" tail (edi=msg, edx=dest)
 CHEAT_NONE = 0x4144ED    # "no cheat matched" exit
@@ -132,19 +148,7 @@ class Asm:
 
     def call(self, target):
         self.raw(0xE8)
-        self.d32(target - (self.here + 4))
-
-    def cmp_ebp(self, value):           # cmp ebp, imm32
-        self.raw(0x81, 0xFD)
-        self.d32(value)
-
-    def if_boosted_local(self, skip):
-        """Fall through only for the local vehicle (ebp) with boost mode on."""
-        self.cmp_byte_zero(BOOST_ON)
-        self.jcc(0x84, skip)
-        self.raw(0x8B, 0x45, 0x10)                      # mov eax, [ebp+0x10]
-        self.raw(0x3B, 0xA8); self.d32(LOCAL_VEHICLE)   # cmp ebp, [eax+0x12d4]
-        self.jcc(0x85, skip)
+        self.d32(self._target(target) - (self.here + 4))
 
     def cmp_byte_zero(self, addr):      # cmp byte ptr [addr], 0
         self.raw(0x80, 0x3D)
@@ -170,6 +174,34 @@ class Asm:
         self.jcc(0x85, CHEAT_TAIL)                      # flag is now 1
         self.raw(0xBF); self.d32(STRINGS[off][0])       # mov edi, off message
         self.jmp(CHEAT_TAIL)
+
+
+def key_table():
+    """Entries of 5 dwords: key, target, step, gate, message format.
+
+    key     scancode for DirectInput events, 0x100 + virtual key for window
+            message events
+    target  step == 0: byte that is set while the key is held
+            otherwise: float that is multiplied by the float at `step` on press
+    gate    byte that must be non-zero for the key to do anything
+    The table ends with a zero key.
+    """
+    def hold(dik, vk, flag):
+        return [(k, flag, 0, ALWAYS, 0) for k in (dik, 0x100 + vk)]
+
+    def scale(keys, target, step, gate, fmt):
+        return [(k, target, step, gate, STRINGS[fmt][0]) for k in keys]
+
+    rows = hold(DIK_PRIOR, VK_PRIOR, FLY_KEY) + hold(DIK_NEXT, VK_NEXT, NPC_FLY_KEY)
+    rows += scale((DIK_ADD, DIK_PLUS_MAIN, 0x100 + VK_ADD, 0x100 + VK_OEM_PLUS),
+                  BOOST, BOOST_UP, BOOST_ON, "boost_fmt")
+    rows += scale((DIK_SUBTRACT, DIK_MINUS_MAIN, 0x100 + VK_SUBTRACT,
+                   0x100 + VK_OEM_MINUS), BOOST, BOOST_DOWN, BOOST_ON, "boost_fmt")
+    rows += scale((DIK_INSERT, 0x100 + VK_INSERT), NPC_BOOST, BOOST_UP, ALWAYS,
+                  "npc_fmt")
+    rows += scale((DIK_DELETE, 0x100 + VK_DELETE), NPC_BOOST, BOOST_DOWN, ALWAYS,
+                  "npc_fmt")
+    return b"".join(struct.pack("<5I", *r) for r in rows) + bytes(4)
 
 
 def assemble_cave(labels, short=frozenset()):
@@ -208,71 +240,54 @@ def assemble_cave(labels, short=frozenset()):
     a.jcc(0x84, 0x43755D)
     a.jmp(0x437238)
 
-    # --- fly: track PageUp in the key event loop ----------------------------
+    # --- keys: look the event up in KEYTAB (esi = game) ----------------------
     # event type: 1/2 = DirectInput down/up, 3/4 = window message down/up
     a.label("keys")
     a.raw(0x8B, 0x44, 0x24, 0x20)                   # mov eax, [esp+0x20] (orig)
     a.raw(0x8B, 0x6C, 0x24, 0x24)                   # mov ebp, [esp+0x24] (orig)
-    a.raw(0x83, 0xF8, 0x02)                         # cmp eax, 2
-    a.jcc(0x87, "keys_vk")                          # ja
-    a.raw(0x81, 0xFD); a.d32(DIK_PRIOR)             # cmp ebp, DIK_PRIOR
-    a.jcc(0x85, "boost_keys")
-    a.jmp("keys_set")
-    a.label("keys_vk")
-    a.raw(0x83, 0xF8, 0x04)                         # cmp eax, 4
+    a.raw(0x8D, 0x48, 0xFF)                         # lea ecx, [eax-1]
+    a.raw(0x83, 0xF9, 0x03)                         # cmp ecx, 3
     a.jcc(0x87, "keys_out")                         # ja
-    a.raw(0x83, 0xFD, VK_PRIOR)                     # cmp ebp, VK_PRIOR
-    a.jcc(0x85, "boost_keys")
-    a.label("keys_set")
-    a.raw(0xA8, 0x01)                               # test al, 1 (odd = down)
-    a.raw(0x0F, 0x95, 0x05); a.d32(FLY_KEY)         # setnz byte [FLY_KEY]
-    a.jmp("keys_out")
-
-    # --- boost: plus / minus key presses (esi = game) ------------------------
-    a.label("boost_keys")
-    a.cmp_byte_zero(BOOST_ON)
+    a.raw(0xD1, 0xE9)                               # shr ecx, 1
+    a.raw(0xC1, 0xE1, 0x08)                         # shl ecx, 8
+    a.raw(0x01, 0xE9)                               # add ecx, ebp
+    a.raw(0xBA); a.d32(KEYTAB - 20)                 # mov edx, KEYTAB - 20
+    a.label("keys_next")
+    a.raw(0x83, 0xC2, 0x14)                         # add edx, 20
+    a.raw(0x83, 0x3A, 0x00)                         # cmp dword [edx], 0
     a.jcc(0x84, "keys_out")
-    a.raw(0x83, 0xF8, 0x01)                         # cmp eax, 1 (DI key down)
-    a.jcc(0x84, "boost_di")
-    a.raw(0x83, 0xF8, 0x03)                         # cmp eax, 3 (WM key down)
-    a.jcc(0x85, "keys_out")
-    for vk, dest in ((VK_ADD, "boost_plus"), (VK_OEM_PLUS, "boost_plus"),
-                     (VK_SUBTRACT, "boost_minus"), (VK_OEM_MINUS, "boost_minus")):
-        a.cmp_ebp(vk)
-        a.jcc(0x84, dest)
-    a.jmp("keys_out")
-    a.label("boost_di")
-    for dik, dest in ((DIK_ADD, "boost_plus"), (DIK_PLUS_MAIN, "boost_plus"),
-                      (DIK_SUBTRACT, "boost_minus"), (DIK_MINUS_MAIN, "boost_minus")):
-        a.cmp_ebp(dik)
-        a.jcc(0x84, dest)
+    a.raw(0x39, 0x0A)                               # cmp [edx], ecx
+    a.jcc(0x85, "keys_next")
+    a.raw(0x8B, 0x4A, 0x0C)                         # mov ecx, [edx+12] (gate)
+    a.raw(0x80, 0x39, 0x00)                         # cmp byte [ecx], 0
+    a.jcc(0x84, "keys_out")
+    a.raw(0x8B, 0x4A, 0x04)                         # mov ecx, [edx+4] (target)
+    a.raw(0x83, 0x7A, 0x08, 0x00)                   # cmp dword [edx+8], 0 (step)
+    a.jcc(0x85, "keys_scale")
+    a.raw(0xA8, 0x01)                               # test al, 1 (odd = down)
+    a.raw(0x0F, 0x95, 0x01)                         # setnz byte [ecx]
     a.jmp("keys_out")
 
-    a.label("boost_plus")
+    a.label("keys_scale")
+    a.raw(0xA8, 0x01)                               # test al, 1
+    a.jcc(0x84, "keys_out")                         # key up -> ignore
     a.raw(0x50)                                     # push eax (event type)
-    a.raw(0xBA); a.d32(BOOST_UP)                    # mov edx, &BOOST_UP
-    a.raw(0xD9, 0x05); a.d32(BOOST)                 # fld  [BOOST]
-    a.raw(0xD8, 0x1D); a.d32(BOOST_MAX)             # fcomp [BOOST_MAX]
+    a.raw(0xD9, 0x01)                               # fld  dword [ecx]
+    a.raw(0x8B, 0x42, 0x08)                         # mov eax, [edx+8]
+    a.raw(0xD8, 0x08)                               # fmul dword [eax]
+    a.raw(0xD8, 0x15); a.d32(BOOST_MAX)             # fcom [BOOST_MAX]
     a.raw(0xDF, 0xE0)                               # fnstsw ax
-    a.raw(0xF6, 0xC4, 0x01)                         # test ah, 1 (BOOST < MAX)
-    a.jcc(0x84, "boost_done")
-    a.jmp("boost_apply")
-    a.label("boost_minus")
-    a.raw(0x50)                                     # push eax (event type)
-    a.raw(0xBA); a.d32(BOOST_DOWN)                  # mov edx, &BOOST_DOWN
-    a.raw(0xD9, 0x05); a.d32(BOOST_MIN)             # fld  [BOOST_MIN]
-    a.raw(0xD8, 0x1D); a.d32(BOOST)                 # fcomp [BOOST]
+    a.raw(0xF6, 0xC4, 0x41)                         # test ah, 0x41
+    a.jcc(0x84, "keys_drop")                        # new > MAX
+    a.raw(0xD8, 0x15); a.d32(BOOST_MIN)             # fcom [BOOST_MIN]
     a.raw(0xDF, 0xE0)                               # fnstsw ax
-    a.raw(0xF6, 0xC4, 0x01)                         # test ah, 1 (MIN < BOOST)
-    a.jcc(0x84, "boost_done")
-    a.label("boost_apply")
-    a.raw(0xD9, 0x05); a.d32(BOOST)                 # fld  [BOOST]
-    a.raw(0xD8, 0x0A)                               # fmul dword [edx]
-    a.raw(0xD9, 0x15); a.d32(BOOST)                 # fst  [BOOST]
+    a.raw(0xF6, 0xC4, 0x01)                         # test ah, 1
+    a.jcc(0x85, "keys_drop")                        # new < MIN
+    a.raw(0xD9, 0x11)                               # fst  dword [ecx]
     a.raw(0xD8, 0x0D); a.d32(HUNDRED)               # fmul [HUNDRED]
     a.raw(0x50)                                     # push eax (slot for %d)
     a.raw(0xDB, 0x1C, 0x24)                         # fistp dword [esp]
-    a.raw(0x68); a.d32(STRINGS["boost_fmt"][0])     # push "Boost %d%%"
+    a.raw(0xFF, 0x72, 0x10)                         # push dword [edx+16] (format)
     a.raw(0x8D, 0x86); a.d32(CHEAT_BUF_END)         # lea eax, [esi+0x2c9]
     a.raw(0x50)                                     # push eax
     a.raw(0xFF, 0x15); a.d32(SPRINTF)               # call [sprintf]
@@ -282,10 +297,27 @@ def assemble_cave(labels, short=frozenset()):
     a.raw(0x6A, 0x00, 0x6A, 0x00)                   # push 0 ; push 0
     a.raw(0x8B, 0x8E); a.d32(GAME_MSG_SOUND)        # mov ecx, [esi+0x165c]
     a.call(MSG_SOUND_FN)
-    a.label("boost_done")
+    a.jmp("keys_done")
+    a.label("keys_drop")
+    a.raw(0xDD, 0xD8)                               # fstp st(0)
+    a.label("keys_done")
     a.raw(0x58)                                     # pop eax
     a.label("keys_out")
     a.jmp(0x41E0A6)
+
+    # --- boost: st(0) *= multiplier of the vehicle in ebp (clobbers eax) ----
+    a.label("scale")
+    a.raw(0x8B, 0x45, 0x10)                         # mov eax, [ebp+0x10]
+    a.raw(0x3B, 0xA8); a.d32(LOCAL_VEHICLE)         # cmp ebp, [eax+0x12d4]
+    a.raw(0xB8); a.d32(NPC_BOOST)                   # mov eax, &NPC_BOOST
+    a.jcc(0x85, "scale_mul")                        # not the local vehicle
+    a.raw(0xB8); a.d32(BOOST)                       # mov eax, &BOOST
+    a.cmp_byte_zero(BOOST_ON)
+    a.jcc(0x84, "scale_ret")
+    a.label("scale_mul")
+    a.raw(0xD8, 0x08)                               # fmul dword [eax]
+    a.label("scale_ret")
+    a.raw(0xC3)                                     # ret
 
     # --- boost: top speed (ebp = vehicle, ecx = type, flags from cmp) --------
     a.label("topspeed")
@@ -293,30 +325,31 @@ def assemble_cave(labels, short=frozenset()):
     a.jcc(0x84, "topspeed_mult")                    # je            (original)
     a.raw(0xD8, 0x0D); a.d32(0x43C768)              # fmul [1.2]    (original)
     a.label("topspeed_mult")
-    a.if_boosted_local("topspeed_out")
-    a.raw(0xD8, 0x0D); a.d32(BOOST)                 # fmul [BOOST]
-    a.label("topspeed_out")
+    a.call("scale")
     a.jmp(0x434298)
 
     # --- boost: forward engine force (ebp = vehicle, ecx = type) ------------
     a.label("accel")
     a.raw(0xD8, 0x89); a.d32(TYPE_ENGINE_FORCE)     # fmul [ecx+0xdc] (orig)
-    a.if_boosted_local("accel_out")
-    a.raw(0xD8, 0x0D); a.d32(BOOST)                 # fmul [BOOST]
-    a.label("accel_out")
+    a.call("scale")
     a.jmp(0x43433C)
 
     # --- fly: per-tick lift in the vehicle update (ebp = vehicle) -----------
     a.label("lift")
     a.raw(0x8B, 0xCD)                               # mov ecx, ebp      (orig)
     a.raw(0xC6, 0x85); a.d32(0x15D); a.raw(0x00)    # mov byte [ebp+0x15d], 0
+    a.raw(0x8B, 0x45, 0x10)                         # mov eax, [ebp+0x10]
+    a.raw(0x3B, 0xA8); a.d32(LOCAL_VEHICLE)         # cmp ebp, [eax+0x12d4]
+    a.jcc(0x85, "lift_npc")
     a.cmp_byte_zero(FLY_ON)
     a.jcc(0x84, "lift_out")
     a.cmp_byte_zero(FLY_KEY)
     a.jcc(0x84, "lift_out")
-    a.raw(0x8B, 0x45, 0x10)                         # mov eax, [ebp+0x10]
-    a.raw(0x3B, 0xA8); a.d32(LOCAL_VEHICLE)         # cmp ebp, [eax+0x12d4]
-    a.jcc(0x85, "lift_out")
+    a.jmp("lift_up")
+    a.label("lift_npc")
+    a.cmp_byte_zero(NPC_FLY_KEY)
+    a.jcc(0x84, "lift_out")
+    a.label("lift_up")
     a.raw(0x8B, 0x85); a.d32(VEH_TYPE)              # mov eax, [ebp+0xf0]
     a.raw(0xD9, 0x40, 0x60)                         # fld  dword [eax+0x60]
     a.raw(0xD8, 0x8D); a.d32(VEH_GRAV_SCALE)        # fmul dword [ebp+0xe0]
@@ -360,9 +393,11 @@ def build():
         (0x43428D, bytes.fromhex("d9416c7406"), hook(0x43428D, "topspeed", 5)),
         (0x434336, bytes.fromhex("d889dc000000"), hook(0x434336, "accel", 6)),
         (CAVE, bytes(len(cave)), cave),
-        (NOCLIP_ON, bytes(4), bytes(4)),
+        (KEYTAB, bytes(len(key_table())), key_table()),
         (FLY_GAIN, bytes(4), struct.pack("<f", FLY_GAIN_VALUE)),
     ]
+    for addr, value in FLAGS.items():
+        patches.append((addr, b"\0", bytes([value])))
     for addr, value in FLOATS.items():
         patches.append((addr, bytes(4), struct.pack("<f", value)))
     for addr, text in STRINGS.values():
