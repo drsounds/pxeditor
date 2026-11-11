@@ -6,6 +6,7 @@ Tools for **Pickup Express** (Addgames, 2000) and its `cc.dll` engine.
 |---|---|
 | `ccformats/` | Python API: `ccf` (chunk tree), `model` (high level scene IR), `gti`, `ccm`, `tcfg`, `vcfg`, `bsp`, `objio`, `constants` (type tables such as `MATERIAL_TYPES`, `NULL_TYPES`, `NAME_SUFFIXES`) |
 | `cceditor/` | wxPython + OpenGL level editor: `python -m cceditor [level.ccf]` |
+| `cceditor/car_editor.py` | wxPython car editor for `.vcfg` vehicle configs: `python -m cceditor.car_editor [car.vcfg]` |
 | `blender_ccf/` | Blender 4.2+ add-on (import/export `.ccf`, OBJ with game data). Build: `python build_blender_addon.py [--install]` -> `dist/pickup_express_ccf.zip` |
 | `pxtool.py` | CLI: `ccf2obj`, `obj2ccf`, `bsp`, `gti2png`, `png2gti`, `ccm`, `info` |
 | `docs/FORMATS.md` | format notes |

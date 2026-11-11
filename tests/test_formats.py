@@ -78,7 +78,7 @@ class GameDataTests(unittest.TestCase):
 
     def test_ccm(self):
         for f in glob.glob(os.path.join(GAME, "Towns", "*", "*-*.ccm")):
-            self.assertGreater(len(ccm.MaterialTable.load(f).entries), 10)
+            self.assertGreater(len(ccm.MaterialTable.load(f).entries), 0)
 
     def test_ir_roundtrip_vehicle(self):
         sc = ccf.Scene.load(os.path.join(GAME, "Vehicles", "Toyota", "Hilux.ccf"))

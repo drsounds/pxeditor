@@ -33,6 +33,11 @@ class MaterialDesc:
         return MATERIAL_TYPE_IDS.get(self.type_name.lower(), 0)
 
 
+def _isnum(x):
+    try: float(x); return True
+    except ValueError: return False
+
+
 @dataclass
 class MaterialTable:
     entries: List[MaterialDesc] = field(default_factory=list)
@@ -46,8 +51,12 @@ class MaterialTable:
             parts = line.split()
             if len(parts) < 2:
                 continue
-            nums = [float(x) for x in parts[2:5]] + [0.0, 0.9, 0.0][len(parts) - 2:]
-            t.entries.append(MaterialDesc(parts[0], parts[1], nums[0], nums[1], nums[2]))
+            # names may contain spaces ("tunnel_road (kopia)"): take the numbers and type from the right
+            k = 0
+            while k < 3 and k < len(parts) - 2 and _isnum(parts[-1 - k]):
+                k += 1
+            nums = [float(x) for x in parts[len(parts) - k:]] + [0.0, 0.9, 0.0][k:]
+            t.entries.append(MaterialDesc(" ".join(parts[:len(parts) - k - 1]), parts[len(parts) - k - 1], nums[0], nums[1], nums[2]))
         return t
 
     @staticmethod

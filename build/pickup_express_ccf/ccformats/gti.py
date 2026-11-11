@@ -64,9 +64,13 @@ class Image:
                 p = data[i * 2] * 4; a = data[i * 2 + 1]
                 out[i * 4] = pal[p + 2]; out[i * 4 + 1] = pal[p + 1]; out[i * 4 + 2] = pal[p]; out[i * 4 + 3] = a
         elif name in ("RGB888", "BGR888"):
-            # stored as B,G,R bytes (little endian 0xRRGGBB)
+            # shipped RGB888 images store the bytes in R,G,B order (verified against the palettised twin,
+            # whose palette and ARGB8888 are B,G,R)
+            rgb = name == "RGB888"
             for i in range(n):
-                out[i * 4] = data[i * 3 + 2]; out[i * 4 + 1] = data[i * 3 + 1]; out[i * 4 + 2] = data[i * 3]; out[i * 4 + 3] = 255
+                a, b, c = data[i * 3], data[i * 3 + 1], data[i * 3 + 2]
+                if not rgb: a, c = c, a
+                out[i * 4] = a; out[i * 4 + 1] = b; out[i * 4 + 2] = c; out[i * 4 + 3] = 255
         elif name in ("ARGB8888", "BGRA8888"):
             for i in range(n):
                 out[i * 4] = data[i * 4 + 2]; out[i * 4 + 1] = data[i * 4 + 1]; out[i * 4 + 2] = data[i * 4]; out[i * 4 + 3] = data[i * 4 + 3]
@@ -167,7 +171,8 @@ class GtiFile:
                 d = data[:w * h * 2].reshape(-1, 2); idx, a = d[:, 0], d[:, 1]
             out[:, 0] = pal[idx, 2]; out[:, 1] = pal[idx, 1]; out[:, 2] = pal[idx, 0]; out[:, 3] = a
         elif name in ("RGB888", "BGR888"):
-            d = data[:w * h * 3].reshape(-1, 3); out[:, 0] = d[:, 2]; out[:, 1] = d[:, 1]; out[:, 2] = d[:, 0]; out[:, 3] = 255
+            d = data[:w * h * 3].reshape(-1, 3); sw = name == "BGR888"
+            out[:, 0] = d[:, 2 if sw else 0]; out[:, 1] = d[:, 1]; out[:, 2] = d[:, 0 if sw else 2]; out[:, 3] = 255
         elif name in ("ARGB8888", "BGRA8888"):
             d = data[:w * h * 4].reshape(-1, 4); out[:, 0] = d[:, 2]; out[:, 1] = d[:, 1]; out[:, 2] = d[:, 0]; out[:, 3] = d[:, 3]
         else:
@@ -210,7 +215,7 @@ class GtiFile:
             if has_alpha:
                 mips.append(lv[:, :, [2, 1, 0, 3]].tobytes())
             else:
-                mips.append(lv[:, :, [2, 1, 0]].tobytes())
+                mips.append(lv[:, :, [0, 1, 2]].tobytes())
         g.images.append(Image(FMT["ARGB8888"] if has_alpha else FMT["RGB888"], w, h, b"", mips))
         return g
 
