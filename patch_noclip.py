@@ -29,6 +29,9 @@ water -- toggles what water does, for every vehicle.  Off (the default, as in
 Keys for every other vehicle (always active, no cheat word):
   PageDown         hold to make all other vehicles rise, like PageUp does
   Insert / Delete  scale their engine force and top speed up / down
+  Backspace        hold to drive them backwards: their engine pushes against
+                   their driving direction with 10x force (REV_GAIN), so they
+                   speed up in reverse for as long as the key is held
 
 Only valid for the 282,624 byte Pickup.exe dated 2000-04-06; every patched
 site is byte-verified before anything is written.
@@ -40,6 +43,8 @@ from pathlib import Path
 BASE = 0x400000          # image base; all sections have RVA == file offset
 CAVE = 0x43BD00          # unused zero padding at the end of .text (0x300 bytes)
 CAVE_END = 0x43C000
+CAVE2 = 0x43F100         # unused zero padding at the end of .rdata, made
+CAVE2_END = 0x440000     # executable by grow_sections(); holds the cheat words
 
 # Unused zero padding at the end of .data
 NOCLIP_ON = 0x442A80     # byte: noclip mode
@@ -50,6 +55,8 @@ BOOST_ON = 0x442A83      # byte: boost mode
 NPC_FLY_KEY = 0x442A88   # byte: fly key for the other vehicles currently held
 ALWAYS = 0x442A89        # byte: constant 1, gate for keys without a mode
 WATER_SOLID = 0x442A8A   # byte: water behaves like a normal surface
+NPC_REV_KEY = 0x442A8B   # byte: reverse key for the other vehicles currently held
+REV_GAIN = 0x442B1C      # float: drive force while reversed, in engine forces
 BOOST = 0x442B00         # float: engine force / top speed multiplier
 BOOST_UP = 0x442B04      # float: step applied by the plus key
 BOOST_DOWN = 0x442B08    # float: step applied by the minus key
@@ -60,10 +67,11 @@ NPC_BOOST = 0x442B18     # float: multiplier for every other vehicle
 FLOATS = {
     BOOST: 1.0, BOOST_UP: 1.25, BOOST_DOWN: 0.8,
     BOOST_MAX: 9.5, BOOST_MIN: 0.25, HUNDRED: 100.0, NPC_BOOST: 1.0,
+    REV_GAIN: -10.0,
 }
 # Initial values of the flag bytes at NOCLIP_ON.. (fly and boost start on).
 FLAGS = {NOCLIP_ON: 0, FLY_ON: 1, FLY_KEY: 0, BOOST_ON: 1,
-         NPC_FLY_KEY: 0, ALWAYS: 1, WATER_SOLID: 0}
+         NPC_FLY_KEY: 0, ALWAYS: 1, WATER_SOLID: 0, NPC_REV_KEY: 0}
 WATER_DELAY = 1.5        # seconds between touching water and the respawn
 KEYTAB = 0x442B80        # key table read by the key event hook, see key_table()
 STRINGS = {
@@ -94,6 +102,7 @@ VK_OEM_PLUS, VK_OEM_MINUS = 0xBB, 0xBD      # main-row + / - on any layout
 DIK_NEXT, VK_NEXT = 0xD1, 0x22              # PageDown: other vehicles fly
 DIK_INSERT, VK_INSERT = 0xD2, 0x2D          # Insert: other vehicles faster
 DIK_DELETE, VK_DELETE = 0xD3, 0x2E          # Delete: other vehicles slower
+DIK_BACK, VK_BACK = 0x0E, 0x08              # Backspace: other vehicles reverse
 
 CHEAT_TAIL = 0x4143D2    # shared "show cheat message" tail (edi=msg, edx=dest)
 CHEAT_NONE = 0x4144ED    # "no cheat matched" exit
@@ -108,6 +117,7 @@ VEH_TYPE = 0xF0          # vehicle->type ; type+0x60 = gravity
 VEH_GRAV_SCALE = 0xE0    # vehicle: gravity force = type.gravity * this
 TYPE_TOP_SPEED = 0x6C    # type: speed above which the engine stops pushing
 TYPE_ENGINE_FORCE = 0xDC # type: forward engine force per unit of throttle
+VEH_DRIVE_FORCE = 0x144  # vehicle: engine force applied at the driven wheels
 VEH_MOMENTUM_Y = 0x11B0  # vehicle rigid body (+0x1150) linear momentum (+0x5c), Y
 
 
@@ -205,6 +215,7 @@ def key_table():
         return [(k, target, step, gate, STRINGS[fmt][0]) for k in keys]
 
     rows = hold(DIK_PRIOR, VK_PRIOR, FLY_KEY) + hold(DIK_NEXT, VK_NEXT, NPC_FLY_KEY)
+    rows += hold(DIK_BACK, VK_BACK, NPC_REV_KEY)
     rows += scale((DIK_ADD, DIK_PLUS_MAIN, 0x100 + VK_ADD, 0x100 + VK_OEM_PLUS),
                   BOOST, BOOST_UP, BOOST_ON, "boost_fmt")
     rows += scale((DIK_SUBTRACT, DIK_MINUS_MAIN, 0x100 + VK_SUBTRACT,
@@ -217,18 +228,20 @@ def key_table():
 
 
 def assemble_cave(labels, short=frozenset()):
-    """Assemble the code cave; returns (code, rel8-capable branches, bad)."""
+    """Assemble both caves; returns (code, rel8-capable branches, bad, code2)."""
     a = Asm(CAVE, labels, short)
 
     # --- extra cheat words, reached when "atlantis" did not match ----------
-    a.label("cheat")
-    a.cheat_word("noclip", NOCLIP_ON, "noclip_on", "noclip_off", "cheat_fly")
-    a.label("cheat_fly")
-    a.cheat_word("fly", FLY_ON, "fly_on", "fly_off", "cheat_boost")
-    a.label("cheat_boost")
-    a.cheat_word("boost", BOOST_ON, "boost_on", "boost_off", "cheat_water")
-    a.label("cheat_water")
-    a.cheat_word("water", WATER_SOLID, "water_on", "water_off", CHEAT_NONE)
+    # (second cave; only near branches, so it needs no relaxation)
+    c = Asm(CAVE2, labels)
+    c.label("cheat")
+    c.cheat_word("noclip", NOCLIP_ON, "noclip_on", "noclip_off", "cheat_fly")
+    c.label("cheat_fly")
+    c.cheat_word("fly", FLY_ON, "fly_on", "fly_off", "cheat_boost")
+    c.label("cheat_boost")
+    c.cheat_word("boost", BOOST_ON, "boost_on", "boost_off", "cheat_water")
+    c.label("cheat_water")
+    c.cheat_word("water", WATER_SOLID, "water_on", "water_off", CHEAT_NONE)
 
     # --- water: the two places that flag a touched polygon as water ---------
     # (flags = material type compared with 15; body collision, then wheels)
@@ -362,6 +375,23 @@ def assemble_cave(labels, short=frozenset()):
     a.call("scale")
     a.jmp(0x43433C)
 
+    # --- reverse: after the engine force is computed (ebp = vehicle) ---------
+    # While the key is held every other vehicle gets a drive force of
+    # REV_GAIN * its engine force, whatever its driver is doing.
+    a.label("reverse")
+    a.raw(0x8B, 0x45, 0x10)                         # mov eax, [ebp+0x10]
+    a.raw(0x3B, 0xA8); a.d32(LOCAL_VEHICLE)         # cmp ebp, [eax+0x12d4]
+    a.jcc(0x84, "reverse_out")                      # local player: untouched
+    a.cmp_byte_zero(NPC_REV_KEY)
+    a.jcc(0x84, "reverse_out")
+    a.raw(0x8B, 0x85); a.d32(VEH_TYPE)              # mov eax, [ebp+0xf0]
+    a.raw(0xD9, 0x80); a.d32(TYPE_ENGINE_FORCE)     # fld  dword [eax+0xdc]
+    a.raw(0xD8, 0x0D); a.d32(REV_GAIN)              # fmul dword [REV_GAIN]
+    a.raw(0xD9, 0x9D); a.d32(VEH_DRIVE_FORCE)       # fstp dword [ebp+0x144]
+    a.label("reverse_out")
+    a.raw(0xD9, 0x85); a.d32(0x104)                 # fld dword [ebp+0x104] (orig)
+    a.jmp(0x4343BF)
+
     # --- fly: per-tick lift in the vehicle update (ebp = vehicle) -----------
     a.label("lift")
     a.raw(0x8B, 0xCD)                               # mov ecx, ebp      (orig)
@@ -386,21 +416,22 @@ def assemble_cave(labels, short=frozenset()):
     a.label("lift_out")
     a.jmp(0x4348CC)
 
-    return bytes(a.buf), a.fits_short, a.out_of_range
+    return bytes(a.buf), a.fits_short, a.out_of_range, bytes(c.buf)
 
 
 def build():
     # Assemble repeatedly: each pass resolves labels from the previous one and
     # shortens branches that turned out to be in rel8 range, until stable.
-    labels, short, cave = {}, set(), b""
+    labels, short, cave, cave2 = {}, set(), b"", b""
     while True:
         before = dict(labels)
-        cave, fits, bad = assemble_cave(labels, frozenset(short))
+        cave, fits, bad, cave2 = assemble_cave(labels, frozenset(short))
         if labels == before and fits <= short:
             assert not bad, "short branch out of range"
             break
         short |= fits
     assert CAVE + len(cave) <= CAVE_END, "code cave overflow"
+    assert CAVE2 + len(cave2) <= CAVE2_END, "second code cave overflow"
 
     def hook(site, label, size):
         h = Asm(site)
@@ -425,7 +456,9 @@ def build():
         # push 1.0 -> push WATER_DELAY: paralysis time before the respawn
         (0x437AFD, bytes.fromhex("680000803f"), b"h" + struct.pack("<f", WATER_DELAY)),
         (0x439079, bytes.fromhex("680000803f"), b"h" + struct.pack("<f", WATER_DELAY)),
+        (0x4343B9, bytes.fromhex("d98504010000"), hook(0x4343B9, "reverse", 6)),
         (CAVE, bytes(len(cave)), cave),
+        (CAVE2, bytes(len(cave2)), cave2),
         (KEYTAB, bytes(len(key_table())), key_table()),
         (FLY_GAIN, bytes(4), struct.pack("<f", FLY_GAIN_VALUE)),
     ]
@@ -439,7 +472,7 @@ def build():
 
 
 def grow_sections(data):
-    """Make the padding used above part of the mapped .text/.data sections."""
+    """Map the padding used above; .rdata also becomes executable (cave 2)."""
     pe = struct.unpack_from("<I", data, 0x3C)[0]
     nsec = struct.unpack_from("<H", data, pe + 6)[0]
     opt = struct.unpack_from("<H", data, pe + 20)[0]
@@ -447,8 +480,11 @@ def grow_sections(data):
         o = pe + 24 + opt + 40 * i
         name = bytes(data[o:o + 8]).rstrip(b"\0")
         vsize, _va, rsize, _raw = struct.unpack_from("<IIII", data, o + 8)
-        if name in (b".text", b".data") and vsize < rsize:
+        if name in (b".text", b".rdata", b".data") and vsize < rsize:
             struct.pack_into("<I", data, o + 8, rsize)
+        if name == b".rdata":
+            flags = struct.unpack_from("<I", data, o + 36)[0]
+            struct.pack_into("<I", data, o + 36, flags | 0x20000000)   # MEM_EXECUTE
 
 
 def main(argv):
