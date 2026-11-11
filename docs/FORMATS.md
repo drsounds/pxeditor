@@ -52,7 +52,7 @@ char[257] package list A, char[256] list B, names separated by CRLF).
 Same values live in the .ccf material (0x2153: None 0, Tree 2, Concrete 10, Water 15).
 
 ## .tcfg  (town config, 102 bytes) / .vcfg  (vehicle config, 193 bytes)
-See `ccformats/tcfg.py` and `ccformats/vcfg.py`.  Minimap: `pixel_x = z*scale_x + off_x`, `pixel_y = x*scale_y + off_y`.
+See `ccformats/tcfg.py` and `ccformats/vcfg.py`.  Minimap: `pixel_x = z*scale_x + off_x`, `pixel_y = x*scale_y + off_y`; three flag bytes in the `.tcfg` negate either scale or swap the two world axes (`TownConfig.map_point`).
 Fields whose engine meaning is not proven carry neutral names.
 
 ## Node-name suffix conventions (OBJ and Blender)

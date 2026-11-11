@@ -560,13 +560,13 @@ class Frame(wx.Frame):
         if c is None:
             g.Append(pg.PropertyCategory("No .tcfg next to this level")); return
         g.Append(pg.PropertyCategory(os.path.basename(self.doc.town_cfg_path or "")))
-        for key, label in (("available_express", "Available: Express"), ("available_bomb", "Available: Bomb"), ("available_stunt", "Available: Stunt")):
+        for key, label in (("available_express", "Available: Express"), ("available_stunt", "Available: Stunt"), ("available_bomb", "Available: Bomb")):
             g.Append(pg.IntProperty(label, key, getattr(c, key)))
         for i, n in enumerate(("Map scale X", "Map scale Y")): g.Append(pg.FloatProperty(n, f"ms{i}", c.map_scale[i]))
         for i, n in enumerate(("Map offset X", "Map offset Y")): g.Append(pg.FloatProperty(n, f"mo{i}", c.map_offset[i]))
-        g.Append(pg.IntProperty("Count", "count", c.count))
-        for i in range(3): g.Append(pg.IntProperty(f"Flag {i}", f"fl{i}", c.flags[i]))
-        g.Append(pg.FloatProperty("Value A", "value_a", c.value_a)); g.Append(pg.FloatProperty("Value B", "value_b", c.value_b))
+        for key, label in (("map_flip_x", "Map flip X"), ("map_flip_y", "Map flip Y"), ("map_swap_axes", "Map swap axes"), ("music_track", "CD music track")):
+            g.Append(pg.IntProperty(label, key, getattr(c, key)))
+        g.Append(pg.FloatProperty("View distance", "view_distance", c.view_distance)); g.Append(pg.FloatProperty("Fuel price", "fuel_price", c.fuel_price))
         g.Append(pg.StringProperty("Description", "description", c.description))
 
     def on_town_changed(self, e):
@@ -574,9 +574,8 @@ class Frame(wx.Frame):
         if c is None: return
         if n.startswith("ms"): s = list(c.map_scale); s[int(n[2])] = float(v); c.map_scale = tuple(s)
         elif n.startswith("mo"): s = list(c.map_offset); s[int(n[2])] = float(v); c.map_offset = tuple(s)
-        elif n.startswith("fl"): s = list(c.flags); s[int(n[2])] = int(v); c.flags = tuple(s)
         elif n == "description": c.description = str(v)
-        elif n in ("value_a", "value_b"): setattr(c, n, float(v))
+        elif n in ("view_distance", "fuel_price"): setattr(c, n, float(v))
         else: setattr(c, n, int(v))
         self.doc.dirty = True; self.update_title()
 
