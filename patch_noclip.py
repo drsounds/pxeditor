@@ -22,7 +22,9 @@ boost -- while the mode is on, the plus and minus keys (numpad, or the main-row
 water -- toggles what water does, for every vehicle.  Off (the default, as in
   the original game): touching water paralyses the vehicle and respawns it,
   after WATER_DELAY seconds (1.5; the original game used 1.0).  On: water is
-  an ordinary surface that can be driven on.
+  a solid surface with full tyre friction (1.0, overriding the friction of
+  the level's water material, which is 0 in some towns), so vehicles can
+  drive and steer on it.
 
 Keys for every other vehicle (always active, no cheat word):
   PageDown         hold to make all other vehicles rise, like PageUp does
@@ -230,12 +232,15 @@ def assemble_cave(labels, short=frozenset()):
 
     # --- water: the two places that flag a touched polygon as water ---------
     # (flags = material type compared with 15; body collision, then wheels)
-    for name, flag_slot, back in (("water_body", 0x13, 0x43794F),
-                                  ("water_wheel", 0x23, 0x4384C2)):
+    # For the wheels, solid water also skips "grip *= material friction"
+    # (0x4384c2..0x4384cc), i.e. water gets friction 1.0 whatever the level
+    # says, so the vehicle can accelerate, brake and steer on it.
+    for name, flag_slot, back, solid in (("water_body", 0x13, 0x43794F, 0x43794F),
+                                         ("water_wheel", 0x23, 0x4384C2, 0x4384CD)):
         a.label(name)
         a.jcc(0x85, back)                           # jne: not water (original)
         a.cmp_byte_zero(WATER_SOLID)
-        a.jcc(0x85, back)                           # solid water: do not flag it
+        a.jcc(0x85, solid)                          # solid water: do not flag it
         a.raw(0xC6, 0x44, 0x24, flag_slot, 0x01)    # mov byte [esp+slot], 1 (orig)
         a.jmp(back)
 
